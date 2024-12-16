@@ -1,6 +1,7 @@
 import PyPDF2
 import re
 import pdfplumber
+import json
 
 def extract_text_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
@@ -62,16 +63,22 @@ def parse_screenplay(script, title):
         }
     }
 
+def screenplay_to_json(screenplay_data, output_file):
+    with open(output_file, 'w', encoding='utf-8') as json_file:
+        json.dump(screenplay_data, json_file, indent=4, ensure_ascii=False)
+
 # Use the extracted text with the screenplay parser
 pdf_path = './Naatyam.pdf'
 script_content = extract_text_from_pdf(pdf_path)
 screenplay_data = parse_screenplay(script_content, "naatyam")
+
+# Convert screenplay data to JSON
+output_json_path = './naatyam_screenplay.json'
+screenplay_to_json(screenplay_data, output_json_path)
+
 print("Scenes:")
 for scene in screenplay_data["screenplay"]["scenes"]:
     print(f"Scene {scene['scene_number']}: {scene['location']}")
     print("Characters:", scene['characters'])
     print("Line Count:", scene['line_count'])
     print()
-
-print("\nAll Characters:")
-print(screenplay_data["screenplay"]["all_characters"])
