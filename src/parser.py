@@ -1,75 +1,77 @@
 import PyPDF2
 import re
+import pdfplumber
 
-#this method takes the pdf and turns it into plain text so that the parser can do its thing
 def extract_text_from_pdf(pdf_path):
-    with open(pdf_path, 'rb') as file:
-        pdf_reader = PyPDF2.PdfReader(file)
-        text = ''
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
     return text
 
 #parser
 def parse_screenplay(script, title):
     scenes = []
-    characters = {}
+    all_characters = set()
     current_scene = None
     current_characters = set()
-    dialogue_interactions = {}
     lines = script.split("\n")
-    scene_pattern = re.compile(r"^\s*(INT\.|EXT\.)")
+    scene_pattern = re.compile(r'^\s*(\d+\.\s*)?(INT\.|EXT\.)')
     character_pattern = re.compile(r"^[A-Z][A-Z\s]+$")
-    dialogue_pattern = re.compile(r"^\s{10,}")
     current_character = None
+    line_count = 0
+
     for line in lines:
         # Identify new scenes
         if scene_pattern.match(line):
             if current_scene:
                 current_scene["characters"] = list(current_characters)
+                current_scene["line_count"] = line_count
                 scenes.append(current_scene)
+
             current_scene = {
                 "scene_number": len(scenes) + 1,
                 "location": line.strip(),
                 "characters": [],
+                "line_count": 0,
             }
             current_characters = set()
-        # Identify characters and their dialogues
-        elif character_pattern.match(line.strip()) and not line.strip().endswith(":"):
+            line_count = 0  # Reset line counter for the new scene
+        
+        # Increment line count if within a scene
+        if current_scene:
+            line_count += 1
+
+        # Identify characters
+        if character_pattern.match(line.strip()) and not line.strip().endswith(":"):
             current_character = line.strip()
-            if current_character not in characters:
-                characters[current_character] = {
-                    "name": current_character,
-                    "dialogue_lines": 0,
-                    "scenes": [],
-                }
-            characters[current_character]["scenes"].append(len(scenes) + 1)
             current_characters.add(current_character)
-        elif dialogue_pattern.match(line) and current_character:
-            characters[current_character]["dialogue_lines"] += 1
-            for other_character in current_characters:
-                if other_character != current_character:
-                    if current_character not in dialogue_interactions:
-                        dialogue_interactions[current_character] = {}
-                    if other_character not in dialogue_interactions[current_character]:
-                        dialogue_interactions[current_character][other_character] = 0
-                    dialogue_interactions[current_character][other_character] += 1
+            all_characters.add(current_character)
+
     # Append the last scene
     if current_scene:
         current_scene["characters"] = list(current_characters)
+        current_scene["line_count"] = line_count
         scenes.append(current_scene)
-    # Convert characters dict to list
-    characters_list = [v for v in characters.values()]
+
     return {
         "screenplay": {
-            "title": title,  # Now uses the passed-in title parameter
-            "characters": characters_list,
+            "title": title,
             "scenes": scenes,
-            "dialogue_interactions": dialogue_interactions,
+            "all_characters": sorted(list(all_characters))
         }
     }
 
 # Use the extracted text with the screenplay parser
-pdf_path = 'your_screenplay.pdf'
+pdf_path = './Naatyam.pdf'
 script_content = extract_text_from_pdf(pdf_path)
-screenplay_data = parse_screenplay(script_content)
+screenplay_data = parse_screenplay(script_content, "naatyam")
+print("Scenes:")
+for scene in screenplay_data["screenplay"]["scenes"]:
+    print(f"Scene {scene['scene_number']}: {scene['location']}")
+    print("Characters:", scene['characters'])
+    print("Line Count:", scene['line_count'])
+    print()
+
+print("\nAll Characters:")
+print(screenplay_data["screenplay"]["all_characters"])
