@@ -1,2 +1,4 @@
 # slate-script-parser
-pdf script parser for slate app
+
+This is a pdf parser for the Slate App.
+Tries to break down a script into scenes, dialogues, characters and etc.
