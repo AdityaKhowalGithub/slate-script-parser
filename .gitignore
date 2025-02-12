@@ -1,2 +1,9 @@
 src/Naatyam.pdf
 src/naatyam_screenplay.json
+venv/
+__pycache__/
+*.pyc
+.env
+.env*
+*.pem
+*.key
