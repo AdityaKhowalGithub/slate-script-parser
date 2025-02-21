@@ -63,13 +63,19 @@ class LocalRegexParser(ScriptParser):
     # Including parentheses, quotes, punctuation, dashes, etc.
     PUNCTUATION_STRIP = r"""[\?\!\:\.\,\(\)'"''""\-]+"""
 
+    # Standard screenplay formatting constants
+    LINES_PER_PAGE = 55  # Standard screenplay format
+    DIALOGUE_LINES_PER_PAGE = 45  # Dialogue takes more vertical space
+    ACTION_LINES_PER_PAGE = 58    # Action blocks are more compact
+    
     def parse(self, content: str, title: str) -> ParsedScript:
         script = ParsedScript(title=title, format_type="standard")
-
+        
         lines = content.split("\n")
         current_scene = None
         scene_buffer: List[str] = []
         active_character = None
+        current_page_count = 0.0
 
         for original_line in lines:
             stripped_line = original_line.strip()
@@ -80,7 +86,8 @@ class LocalRegexParser(ScriptParser):
             if self._is_scene_heading(stripped_line):
                 # Finalize previous scene if present
                 if current_scene:
-                    self._process_scene(current_scene, scene_buffer, script)
+                    self._process_scene(current_scene, scene_buffer, script, current_page_count)
+                    current_page_count += current_scene.page_count
                     scene_buffer = []
 
                 current_scene = Scene(
@@ -89,6 +96,7 @@ class LocalRegexParser(ScriptParser):
                     scene_type=self._extract_scene_type(stripped_line),
                     location=self._extract_location(stripped_line),
                     time_of_day=self._extract_time(stripped_line),
+                    start_page=current_page_count
                 )
                 active_character = None
                 scene_buffer.append(stripped_line)
@@ -123,8 +131,11 @@ class LocalRegexParser(ScriptParser):
 
         # Finalize last scene
         if current_scene and scene_buffer:
-            self._process_scene(current_scene, scene_buffer, script)
+            self._process_scene(current_scene, scene_buffer, script, current_page_count)
+            current_page_count += current_scene.page_count
 
+        # Set total pages for the script
+        script.total_pages = current_page_count
         return script
 
     def _is_scene_heading(self, line: str) -> bool:
@@ -225,21 +236,29 @@ class LocalRegexParser(ScriptParser):
 
     def _extract_location(self, scene_text: str) -> str:
         """
-        Remove INT/EXT prefix and any trailing time-of-day info after a dash.
+        Extract just the location part, removing:
+        1. INT/EXT prefix
+        2. Any time-of-day suffix
+        Example: "INT. SPACE SHUTTLE COCKPIT - DAY" -> "SPACE SHUTTLE COCKPIT"
         """
+        # First remove the INT/EXT prefix
         location_part = re.sub(r"^(INT\.|EXT\.|INT/EXT\.|INT/EXT)\s*", "", scene_text, flags=re.IGNORECASE)
-        # If there's a dash, we assume what's after might be time info
+        
+        # Remove any time of day indicators that follow a dash
         if "-" in location_part:
-            location_part = location_part.split("-", 1)[0]
-        return location_part.strip()
+            location_part = location_part.split("-")[0]
+            
+        # Clean up any remaining whitespace
+        location_part = location_part.strip()
+        
+        return location_part
 
     def _extract_time(self, scene_text: str) -> TimeOfDay:
         """
-        Extract time-of-day from the part after a dash (e.g., DAY, NIGHT).
+        Extract time-of-day from the part after a dash (e.g., DAY, NIGHT, CONTINUOUS).
+        Handles various time formats and special cases like CONTINUOUS or MOMENTS LATER.
         """
-        if "-" not in scene_text:
-            return TimeOfDay.UNKNOWN
-        time_part = scene_text.split("-", 1)[1].strip().upper()
+        # Standard time mapping
         mapping = {
             "MORNING": TimeOfDay.MORNING,
             "DAY": TimeOfDay.DAY,
@@ -248,15 +267,109 @@ class LocalRegexParser(ScriptParser):
             "NIGHT": TimeOfDay.NIGHT,
             "DAWN": TimeOfDay.DAWN,
             "DUSK": TimeOfDay.DUSK,
+            "CONTINUOUS": TimeOfDay.CONTINUOUS,
+            "LATER": TimeOfDay.LATER,
+            "MOMENTS LATER": TimeOfDay.MOMENTS_LATER,
+            "SAME TIME": TimeOfDay.SAME_TIME,
         }
-        return mapping.get(time_part, TimeOfDay.UNKNOWN)
 
-    def _process_scene(self, scene: Scene, scene_buffer: List[str], script: ParsedScript):
+        # If no dash, check for special cases in parentheses
+        if "(" in scene_text and ")" in scene_text:
+            paren_content = re.search(r'\((.*?)\)', scene_text)
+            if paren_content:
+                time_part = paren_content.group(1).strip().upper()
+                # Check if parenthetical content matches any time indicator
+                if time_part in mapping:
+                    return mapping[time_part]
+                # Handle variations of CONTINUOUS
+                if "CONT" in time_part or time_part == "CONT'D":
+                    return TimeOfDay.CONTINUOUS
+                # Handle variations of LATER
+                if "LATER" in time_part:
+                    if "MOMENTS" in time_part or "MOMENT" in time_part:
+                        return TimeOfDay.MOMENTS_LATER
+                    return TimeOfDay.LATER
+                if "SAME" in time_part and "TIME" in time_part:
+                    return TimeOfDay.SAME_TIME
+
+        # Check for time after dash
+        if "-" in scene_text:
+            time_part = scene_text.split("-", 1)[1].strip().upper()
+            # Remove any parentheses
+            time_part = re.sub(r'\(.*?\)', '', time_part).strip()
+            
+            # Direct mapping check
+            if time_part in mapping:
+                return mapping[time_part]
+            
+            # Handle variations
+            if "CONT" in time_part or time_part == "CONT'D":
+                return TimeOfDay.CONTINUOUS
+            if "LATER" in time_part:
+                if "MOMENTS" in time_part or "MOMENT" in time_part:
+                    return TimeOfDay.MOMENTS_LATER
+                return TimeOfDay.LATER
+            if "SAME" in time_part and "TIME" in time_part:
+                return TimeOfDay.SAME_TIME
+
+        return TimeOfDay.UNKNOWN
+
+    def _calculate_page_count(self, scene_buffer: List[str]) -> float:
         """
-        Finalize the scene's line_count, page_count, etc. then add it to the script.
+        Calculate page count more accurately based on line types:
+        - Dialogue lines take more space
+        - Action blocks are more compact
+        - Scene headings and transitions count as action lines
+        """
+        dialogue_line_count = 0
+        action_line_count = 0
+        
+        in_dialogue = False
+        for line in scene_buffer:
+            stripped = line.strip()
+            
+            # Skip empty lines
+            if not stripped:
+                continue
+                
+            # Check if this is a character name (all caps, not a scene heading)
+            if re.match(r"^[A-Z][A-Z\s]+$", stripped) and not any(
+                heading in stripped for heading in ["INT.", "EXT.", "INT/EXT"]
+            ):
+                in_dialogue = True
+                dialogue_line_count += 1
+                continue
+            
+            # If we're in dialogue, count as dialogue lines until empty line
+            if in_dialogue:
+                if not stripped:
+                    in_dialogue = False
+                else:
+                    dialogue_line_count += 1
+            else:
+                action_line_count += 1
+        
+        # Calculate pages based on line type ratios
+        dialogue_pages = dialogue_line_count / self.DIALOGUE_LINES_PER_PAGE
+        action_pages = action_line_count / self.ACTION_LINES_PER_PAGE
+        
+        return round(dialogue_pages + action_pages, 2)
+
+    def _process_scene(self, scene: Scene, scene_buffer: List[str], script: ParsedScript, current_page_count: float):
+        """
+        Finalize the scene's metrics including accurate page count and page ranges.
         """
         scene.line_count = len(scene_buffer)
         scene.raw_text = "\n".join(scene_buffer)
-        scene.page_count = scene.line_count / 55.0  # approximate lines per page
+        
+        # Calculate more accurate page count
+        scene.page_count = self._calculate_page_count(scene_buffer)
+        
+        # Set page range
+        scene.start_page = current_page_count
+        scene.end_page = current_page_count + scene.page_count
+        
+        # Calculate estimated duration based on the new page count
         scene.estimated_duration = self._estimate_duration(scene.line_count, scene.page_count)
+        
         script.scenes.append(scene) 
