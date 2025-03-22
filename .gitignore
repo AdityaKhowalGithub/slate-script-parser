@@ -7,3 +7,6 @@ __pycache__/
 .env*
 *.pem
 *.key
+parsing_results.json
+johnwick-4.json
+naatyam_screenplay.json

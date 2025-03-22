@@ -1,9 +1,20 @@
 from flask import Flask, request, jsonify
 import tempfile
 import os
-from parser import parse_screenplay, extract_text_from_pdf
+from format_parsers import parse_screenplay  # Import from format_parsers instead of parser
+import pdfplumber  # Import pdfplumber directly for extract_text_from_pdf
 
 app = Flask(__name__)
+
+def extract_text_from_pdf(pdf_path):
+    """
+    Extract text content from a PDF file.
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
+    return text
 
 @app.route('/')
 def home():
@@ -38,7 +49,7 @@ def parse_script():
             # Extract text from PDF
             script_content = extract_text_from_pdf(tmp_file.name)
             
-            # Parse the screenplay
+            # Parse the screenplay using the new parser from format_parsers.py
             screenplay_data = parse_screenplay(
                 script_content, 
                 title=os.path.splitext(file.filename)[0]
@@ -47,17 +58,14 @@ def parse_script():
             # Add some additional statistics
             stats = {
                 "total_scenes": len(screenplay_data["screenplay"]["scenes"]),
-                "total_characters": len(screenplay_data["screenplay"]["all_characters"]),
+                "total_characters": len(screenplay_data["screenplay"]["characters"]),
+                "total_pages": screenplay_data["screenplay"]["total_pages"],
                 "character_scene_count": {}
             }
             
             # Count scenes per character
-            for character in screenplay_data["screenplay"]["all_characters"]:
-                scene_count = sum(
-                    1 for scene in screenplay_data["screenplay"]["scenes"] 
-                    if character in scene["characters"]
-                )
-                stats["character_scene_count"][character] = scene_count
+            for character in screenplay_data["screenplay"]["characters"]:
+                stats["character_scene_count"][character["name"]] = len(character["scene_appearances"])
             
             screenplay_data["statistics"] = stats
             
@@ -68,4 +76,4 @@ def parse_script():
             os.unlink(tmp_file.name)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000) 
+    app.run(host='0.0.0.0', port=8000)

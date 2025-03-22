@@ -1,375 +1,596 @@
-from abc import ABC, abstractmethod
 import re
-from typing import List, Tuple, Optional, Set, Dict
-from datetime import timedelta
-import os
-from functools import lru_cache
 import json
-from dotenv import load_dotenv
-import requests
-from azure.core.credentials import AzureKeyCredential
-import time
-import uuid
-from azure.storage.blob import BlobServiceClient
-import logging
+from typing import Dict, Any, List, Set
 
-from models import (
-    ParsedScript,
-    Scene,
-    Character,
-    TimeOfDay,
-    SceneType,
-    CrewRequirement
-)
-
-load_dotenv()  # Load environment variables from .env
-
-logger = logging.getLogger(__name__)
-
-class ScriptParser(ABC):
-    """Abstract base class for script parsers."""
-    
-    @abstractmethod
-    def parse(self, content: str, title: str) -> ParsedScript:
-        """Parse the script content and return a ParsedScript object."""
-        pass
-
-    def _estimate_duration(self, line_count: int, page_count: float) -> timedelta:
-        """Estimate scene filming duration based on industry standards.
-        Currently, it assumes a multiplier of 3 minutes per page.
-        """
-        multiplier = 3  # minutes per page, adjust as needed
-        base_minutes = max(0.5, page_count * multiplier)
-        return timedelta(minutes=base_minutes)
-
-class LocalRegexParser(ScriptParser):
+def extract_text_from_pdf(pdf_path):
     """
-    A more strict LocalRegexParser focusing on:
-      - Better punctuation removal.
-      - Stricter uppercase ratio checks.
-      - Blocking specific words / phrases (like 'BY', 'THE END') more thoroughly.
-      - Trying to avoid false positives (like "comm)", "keyboard.", etc.).
+    Extract text from a PDF file.
+    This function is included here for consistency but is defined in the API.
     """
+    import pdfplumber
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
+    return text
 
-    # Known words or phrases commonly found in scripts but not character names
-    BLOCKED_WORDS = {
-        "INT", "EXT", "CUT", "FADE", "DISSOLVE", "VOICE",
-        "TO:", "ANGLE", "TITLE", "OVER", "BY", "END",
-        "THE END", "SCENE", "CONTINUED", "TRANSITION",
-        "CREDITS", "CREDIT", "SCRIPT"
-    }
-
-    # Regex pattern to strip typical punctuation from the start/end of lines
-    # Including parentheses, quotes, punctuation, dashes, etc.
-    PUNCTUATION_STRIP = r"""[\?\!\:\.\,\(\)'"''""\-]+"""
-
-    # Standard screenplay formatting constants
-    LINES_PER_PAGE = 55  # Standard screenplay format
-    DIALOGUE_LINES_PER_PAGE = 45  # Dialogue takes more vertical space
-    ACTION_LINES_PER_PAGE = 58    # Action blocks are more compact
+def parse_screenplay(script, title):
+    """
+    Parse screenplay text into structured data.
+    Two-pass approach:
+    1. First pass: Identify scenes and dialogue characters
+    2. Second pass: Look for already-identified characters in action text
     
-    def parse(self, content: str, title: str) -> ParsedScript:
-        script = ParsedScript(title=title, format_type="standard")
+    Args:
+        script: The text content of the screenplay
+        title: The title of the screenplay
         
-        lines = content.split("\n")
-        current_scene = None
-        scene_buffer: List[str] = []
-        active_character = None
-        current_page_count = 0.0
-
-        for original_line in lines:
-            stripped_line = original_line.strip()
-            if not stripped_line:
-                continue
-
-            # SCENE HEADING CHECK
-            if self._is_scene_heading(stripped_line):
-                # Finalize previous scene if present
-                if current_scene:
-                    self._process_scene(current_scene, scene_buffer, script, current_page_count)
-                    current_page_count += current_scene.page_count
-                    scene_buffer = []
-
-                current_scene = Scene(
-                    id=len(script.scenes) + 1,
-                    title=f"Scene {len(script.scenes) + 1}",
-                    scene_type=self._extract_scene_type(stripped_line),
-                    location=self._extract_location(stripped_line),
-                    time_of_day=self._extract_time(stripped_line),
-                    start_page=current_page_count
-                )
-                active_character = None
-                scene_buffer.append(stripped_line)
-                continue
-
-            # CHARACTER NAME CHECK
-            if current_scene and self._is_character_candidate(stripped_line):
-                cleaned_name = self._clean_character_name(stripped_line)
-                if cleaned_name:
-                    logger.debug(f"Recognized character name '{cleaned_name}' from line: {original_line}")
-                    active_character = cleaned_name
-                    # Ensure character in dictionary
-                    if active_character not in script.characters:
-                        script.characters[active_character] = Character(name=active_character)
-                    # Record the appearance if not already in this scene
-                    char_obj = script.characters[active_character]
-                    if current_scene.id not in char_obj.scene_appearances:
-                        char_obj.scene_appearances.append(current_scene.id)
-                        current_scene.characters.append(char_obj)
-                else:
-                    logger.debug(f"Rejected line as character name: {original_line}")
-                    active_character = None
-            else:
-                active_character = None
-
-            # Always add the line to the current scene buffer if in a scene
-            if current_scene:
-                scene_buffer.append(stripped_line)
-                # If we found a valid character above, increment their line count
-                if active_character:
-                    script.characters[active_character].total_lines += 1
-
-        # Finalize last scene
-        if current_scene and scene_buffer:
-            self._process_scene(current_scene, scene_buffer, script, current_page_count)
-            current_page_count += current_scene.page_count
-
-        # Set total pages for the script
-        script.total_pages = current_page_count
-        return script
-
-    def _is_scene_heading(self, line: str) -> bool:
+    Returns:
+        Dictionary containing the structured screenplay data
+    """
+    # Regex patterns
+    scene_pattern = re.compile(r'^\s*(\d+\.\s*)?(INT\.|EXT\.|INT/EXT\.|INT/EXT)')
+    character_pattern = re.compile(r"^[A-Z][A-Z\s]+$")
+    
+    # Blocked words for character detection - expanded list
+    BLOCKED_WORDS = {
+        # Scene elements
+        "INT", "EXT", "CUT", "FADE", "DISSOLVE", "VOICE", "TITLE",
+        "TO:", "ANGLE", "TITLE", "OVER", "BY", "END", "CONT'D", 
+        "THE END", "SCENE", "CONTINUED", "TRANSITION", "FLASHBACK",
+        "CREDITS", "CREDIT", "SCRIPT", "FADE IN", "FADE OUT",
+        "DISSOLVE TO", "CUT TO", "SMASH CUT", "INTERCUT", "SUPER",
+        "MONTAGE", "SERIES OF SHOTS", "BACK TO SCENE", "PRELAP",
+        "TREATMENT", "SCREENPLAY",
+        
+        # Technical directions
+        "ANGLE ON", "CLOSE ON", "CLOSE UP", "WIDE ON", "PAN TO", "TRACK",
+        "CAMERA", "DOLLY", "SLOW MOTION", "TIME LAPSE", "AERIAL VIEW",
+        "POV", "POINT OF VIEW", "SPLIT SCREEN", "MUSIC", "SOUND", "BLACK",
+        "BLACKNESS", "DARKNESS", "LIGHT", "HOLD", "CONTINUOUS", "TRACKING",
+        "MOVING", "FOLLOWING", "BACK TO", "SAME TIME", "LATER", "FLASHBACK",
+        "FLASH CUT", "BLUR", "FOCUS", "FOREGROUND", "BACKGROUND",
+        "OPENING", "CLOSING", "PREVIOUSLY", "SUBTITLE", "MESSAGE", "WE SEE",
+        "WE HEAR", "SERIES OF", "ESTABLISHING", "SHOT OF", "DREAM SEQUENCE",
+        "AWAIT INSTRUCTIONS"
+        
+        # Common production elements
+        "PRESENT", "PRESENTS", "PRODUCTION", "PRODUCED", "DIRECTED",
+        "WRITTEN", "STARRING", "CAST", "CREW", "PRODUCER", "DIRECTOR",
+        "WRITER", "PRODUCTIONS", "PICTURES", "STUDIO", "PRESENTS", 
+        "SUPER", "CHYRON", "TITLE CARD",
+        
+        # Generic terms often in all caps
+        "NOTE", "IMPORTANT", "WARNING", "CAUTION", "NOTICE", "ATTENTION",
+        "HELLO", "HEY", "YES", "NO", "WAIT", "STOP", "GO", "LOOK", "LISTEN"
+    }
+    
+    # Common character name misspellings and variations
+    CHARACTER_ALIASES = {
+        # Add other known character variations here
+    }
+    
+    # Words that indicate non-character elements even if they look like character cues
+    TECHNICAL_PHRASES = [
+        "WIDE ON", "ANGLE ON", "CUT TO", "FADE IN", "FADE OUT", "DISSOLVE TO",
+        "SMASH CUT", "PRELAP", "HOLD IN", "BACK TO", "CLOSE ON", "CLOSE UP",
+        "PAN TO", "TRACK TO", "DOLLY IN", "SLOW MOTION", "TIME LAPSE", "AERIAL VIEW",
+        "POINT OF VIEW", "SPLIT SCREEN", "MONTAGE", "SERIES OF", "FOLLOWING",
+        "SAME TIME", "LATER", "CONTINUOUS", "PREVIOUSLY", "WE SEE", "WE HEAR",
+        "ANGLE OF", "VIEW OF", "IN BLACK", "SHOT OF", "DREAM SEQUENCE"
+    ]
+    
+    # Time of day mapping
+    time_mapping = {
+        "MORNING": "MORNING",
+        "DAY": "DAY",
+        "AFTERNOON": "AFTERNOON",
+        "EVENING": "EVENING",
+        "NIGHT": "NIGHT",
+        "DAWN": "DAWN",
+        "DUSK": "DUSK",
+        "CONTINUOUS": "CONTINUOUS",
+        "LATER": "LATER",
+        "MOMENTS LATER": "MOMENTS_LATER",
+        "SAME TIME": "SAME_TIME"
+    }
+    
+    # Constants for page calculation
+    DIALOGUE_LINES_PER_PAGE = 45
+    ACTION_LINES_PER_PAGE = 58
+    
+    #-----------------------------------------------------------------------
+    # Helper functions
+    #-----------------------------------------------------------------------
+    
+    def is_character_name(line):
         """
-        Check if it starts with typical scene heading keywords (INT, EXT, INT/EXT, etc.).
+        Determine if a line is a valid character name.
+        More aggressive filtering to avoid technical directions and scene elements.
         """
-        pattern = r"^\s*(INT\.|EXT\.|INT/EXT\.|INT/EXT|INT|EXT)"
-        return bool(re.match(pattern, line, re.IGNORECASE))
-
-    def _is_character_candidate(self, line: str) -> bool:
-        """
-        Initial quick check to see if line could be a character name:
-          1. Not too many words (<= 5).
-          2. Contains at least some alphabetic chars.
-          3. Does not contain certain blocked words or transitions.
-        Further cleaning in _clean_character_name will finalize validity.
-        """
-        words = line.split()
-        if len(words) > 5:
+        stripped = line.strip()
+        
+        # Too many words
+        if len(stripped.split()) > 5:
             return False
-
-        if any(bword in line.upper() for bword in self.BLOCKED_WORDS):
-            return False
-
-        # Must have at least 2 alpha characters
-        alpha_count = sum(1 for c in line if c.isalpha())
+        
+        # Contains any blocked words
+        for word in BLOCKED_WORDS:
+            if word in stripped.upper():
+                # Special case: if the blocked word is a substring but not a full match,
+                # continue checking (e.g., "INTERIOR" shouldn't match "INTERIOR DESIGNER")
+                if word != stripped.upper() and not re.search(r'\b' + word + r'\b', stripped.upper()):
+                    continue
+                return False
+        
+        # Not enough alpha characters
+        alpha_count = sum(1 for c in stripped if c.isalpha())
         if alpha_count < 2:
             return False
-
+            
+        # Must match character pattern (all caps) but allow for some parenthetical content
+        base_name = re.sub(r"\(.*?\)", "", stripped).strip()
+        if not character_pattern.match(base_name):
+            return False
+            
+        # Clean parenthetical elements like (O.S.) or (V.O.)
+        clean_name = re.sub(r"\(.*?\)", "", stripped).strip()
+        if not clean_name:
+            return False
+        
+        # Check if it looks like a scene heading despite passing other checks
+        if scene_pattern.match(clean_name):
+            return False
+            
+        # Check for technical phrases that might be mistaken for character names
+        for phrase in TECHNICAL_PHRASES:
+            if clean_name.startswith(phrase) or clean_name.endswith(phrase) or phrase in clean_name:
+                return False
+                
+        # Exclude generic instructions that are often in all caps
+        if clean_name in ["MUSIC", "SOUND", "BLACK", "CONTINUOUS", "SAME", "LATER", 
+                         "INSTRUCTIONS", "AWAIT", "GATHER", "HOLD", "PRESENTS"]:
+            return False
+                
+        # Exclude phrases that contain common technical terms
+        if any(term in clean_name for term in ["PRESENTS", "IN BLACK", "PRODUCTION", "MUSIC", "SOUND", 
+                                              "FADE", "CUT", "DISSOLVE", "TRACK", "PAN", "WIDE"]):
+            return False
+        
+        # This appears to be a valid character name
         return True
 
-    def _clean_character_name(self, line: str) -> str:
+    def normalize_character_name(name):
         """
-        Strip punctuation, parentheses, and evaluate uppercase ratio.
-        Return a fully uppercase name if it passes all checks, else empty string.
+        Normalize character names to handle variations and misspellings.
         """
-        # Remove leading/trailing punctuation
-        line = re.sub(f"^{self.PUNCTUATION_STRIP}", "", line)
-        line = re.sub(f"{self.PUNCTUATION_STRIP}$", "", line)
-        # Remove internal parentheses content entirely (like (O.S.), (V.O.), etc.)
-        line = re.sub(r"\(.*?\)", "", line).strip()
-
-        if not line:
-            return ""
-
-        # If line EXACTLY matches or partially matches any blocked word, skip
-        # e.g. "THE END" -> skip
-        if line.upper() in self.BLOCKED_WORDS:
-            return ""
-
-        # Convert to uppercase
-        upper_line = line.upper()
-
-        # Now remove again any trailing punctuation that might have re-surfaced
-        upper_line = re.sub(f"^{self.PUNCTUATION_STRIP}", "", upper_line)
-        upper_line = re.sub(f"{self.PUNCTUATION_STRIP}$", "", upper_line).strip()
-
-        # If still empty, skip
-        if not upper_line:
-            return ""
-
-        # Check uppercase ratio
-        alpha_count = sum(1 for c in upper_line if c.isalpha())
-        uppercase_count = sum(1 for c in upper_line if c.isalpha() and c.isupper())
-        if alpha_count == 0:
-            return ""
-
-        uppercase_ratio = uppercase_count / alpha_count
-
-        # Additional skip if the name is ironically one of the blocked words
-        if upper_line in self.BLOCKED_WORDS:
-            return ""
-
-        # If line has 2+ words and is less than 80% uppercase, skip it
-        # Single-word character lines are common, so a single word can pass more easily
-        word_count = len(upper_line.split())
-        if word_count > 1 and uppercase_ratio < 0.8:
-            return ""
-
-        # Example final check: length limit to avoid huge lines as names
-        if len(upper_line) > 40:
-            return ""
-
-        return upper_line
-
-    def _extract_scene_type(self, scene_text: str) -> SceneType:
-        """
-        Infer scene type from the heading (INT, EXT, INT/EXT).
-        """
-        text_up = scene_text.upper()
-        if "INT." in text_up:
-            return SceneType.INTERIOR
-        elif "EXT." in text_up:
-            return SceneType.EXTERIOR
-        elif "INT/EXT." in text_up or "INT/EXT" in text_up:
-            return SceneType.INTERIOR_EXTERIOR
-        return SceneType.UNKNOWN
-
-    def _extract_location(self, scene_text: str) -> str:
-        """
-        Extract just the location part, removing:
-        1. INT/EXT prefix
-        2. Any time-of-day suffix
-        Example: "INT. SPACE SHUTTLE COCKPIT - DAY" -> "SPACE SHUTTLE COCKPIT"
-        """
-        # First remove the INT/EXT prefix
-        location_part = re.sub(r"^(INT\.|EXT\.|INT/EXT\.|INT/EXT)\s*", "", scene_text, flags=re.IGNORECASE)
+        # Remove any parenthetical elements
+        clean_name = re.sub(r"\(.*?\)", "", name).strip()
         
-        # Remove any time of day indicators that follow a dash
-        if "-" in location_part:
-            location_part = location_part.split("-")[0]
-            
-        # Clean up any remaining whitespace
-        location_part = location_part.strip()
+        # Use alias mapping if available
+        if clean_name in CHARACTER_ALIASES:
+            return CHARACTER_ALIASES[clean_name]
         
-        return location_part
-
-    def _extract_time(self, scene_text: str) -> TimeOfDay:
-        """
-        Extract time-of-day from the part after a dash (e.g., DAY, NIGHT, CONTINUOUS).
-        Handles various time formats and special cases like CONTINUOUS or MOMENTS LATER.
-        """
-        # Standard time mapping
-        mapping = {
-            "MORNING": TimeOfDay.MORNING,
-            "DAY": TimeOfDay.DAY,
-            "AFTERNOON": TimeOfDay.AFTERNOON,
-            "EVENING": TimeOfDay.EVENING,
-            "NIGHT": TimeOfDay.NIGHT,
-            "DAWN": TimeOfDay.DAWN,
-            "DUSK": TimeOfDay.DUSK,
-            "CONTINUOUS": TimeOfDay.CONTINUOUS,
-            "LATER": TimeOfDay.LATER,
-            "MOMENTS LATER": TimeOfDay.MOMENTS_LATER,
-            "SAME TIME": TimeOfDay.SAME_TIME,
-        }
-
-        # If no dash, check for special cases in parentheses
-        if "(" in scene_text and ")" in scene_text:
-            paren_content = re.search(r'\((.*?)\)', scene_text)
-            if paren_content:
-                time_part = paren_content.group(1).strip().upper()
-                # Check if parenthetical content matches any time indicator
-                if time_part in mapping:
-                    return mapping[time_part]
-                # Handle variations of CONTINUOUS
+        return clean_name
+    
+    def extract_time(text):
+        """Helper function to extract time of day from scene heading"""
+        # Check parentheses first
+        if "(" in text and ")" in text:
+            paren_match = re.search(r'\((.*?)\)', text)
+            if paren_match:
+                time_part = paren_match.group(1).strip().upper()
+                # Direct mapping check
+                if time_part in time_mapping:
+                    return time_mapping[time_part]
+                # Handle variations
                 if "CONT" in time_part or time_part == "CONT'D":
-                    return TimeOfDay.CONTINUOUS
-                # Handle variations of LATER
+                    return "CONTINUOUS"
                 if "LATER" in time_part:
-                    if "MOMENTS" in time_part or "MOMENT" in time_part:
-                        return TimeOfDay.MOMENTS_LATER
-                    return TimeOfDay.LATER
+                    return "MOMENTS_LATER" if "MOMENTS" in time_part else "LATER"
                 if "SAME" in time_part and "TIME" in time_part:
-                    return TimeOfDay.SAME_TIME
+                    return "SAME_TIME"
 
-        # Check for time after dash
-        if "-" in scene_text:
-            time_part = scene_text.split("-", 1)[1].strip().upper()
+        # Check after dash
+        if "-" in text:
+            time_part = text.split("-", 1)[1].strip().upper()
             # Remove any parentheses
             time_part = re.sub(r'\(.*?\)', '', time_part).strip()
             
             # Direct mapping check
-            if time_part in mapping:
-                return mapping[time_part]
+            if time_part in time_mapping:
+                return time_mapping[time_part]
             
             # Handle variations
             if "CONT" in time_part or time_part == "CONT'D":
-                return TimeOfDay.CONTINUOUS
+                return "CONTINUOUS"
             if "LATER" in time_part:
-                if "MOMENTS" in time_part or "MOMENT" in time_part:
-                    return TimeOfDay.MOMENTS_LATER
-                return TimeOfDay.LATER
+                return "MOMENTS_LATER" if "MOMENTS" in time_part else "LATER"
             if "SAME" in time_part and "TIME" in time_part:
-                return TimeOfDay.SAME_TIME
-
-        return TimeOfDay.UNKNOWN
-
-    def _calculate_page_count(self, scene_buffer: List[str]) -> float:
-        """
-        Calculate page count more accurately based on line types:
-        - Dialogue lines take more space
-        - Action blocks are more compact
-        - Scene headings and transitions count as action lines
-        """
-        dialogue_line_count = 0
-        action_line_count = 0
+                return "SAME_TIME"
         
+        return "UNKNOWN"
+
+    def calculate_page_count(scene_lines):
+        """Calculate page count based on line types"""
+        dialogue_lines = 0
+        action_lines = 0
         in_dialogue = False
-        for line in scene_buffer:
+        
+        for line in scene_lines:
             stripped = line.strip()
-            
-            # Skip empty lines
             if not stripped:
                 continue
                 
-            # Check if this is a character name (all caps, not a scene heading)
-            if re.match(r"^[A-Z][A-Z\s]+$", stripped) and not any(
-                heading in stripped for heading in ["INT.", "EXT.", "INT/EXT"]
-            ):
+            # Check if this is a character name
+            if character_pattern.match(stripped) and not scene_pattern.match(stripped):
                 in_dialogue = True
-                dialogue_line_count += 1
+                dialogue_lines += 1
                 continue
-            
-            # If we're in dialogue, count as dialogue lines until empty line
+                
+            # Count dialogue or action lines
             if in_dialogue:
                 if not stripped:
                     in_dialogue = False
                 else:
-                    dialogue_line_count += 1
+                    dialogue_lines += 1
             else:
-                action_line_count += 1
+                action_lines += 1
         
         # Calculate pages based on line type ratios
-        dialogue_pages = dialogue_line_count / self.DIALOGUE_LINES_PER_PAGE
-        action_pages = action_line_count / self.ACTION_LINES_PER_PAGE
-        
+        dialogue_pages = dialogue_lines / DIALOGUE_LINES_PER_PAGE
+        action_pages = action_lines / ACTION_LINES_PER_PAGE
         return round(dialogue_pages + action_pages, 2)
+    
+    #-----------------------------------------------------------------------
+    # First pass: Identify scenes and dialogue characters
+    #-----------------------------------------------------------------------
+    lines = script.split('\n')
+    scenes = []
+    scene_buffers = []  # Store raw text for each scene
+    all_characters = set()  # All characters found in dialogue
+    
+    current_scene = None
+    current_characters = set()
+    scene_buffer = []
+    line_count = 0
+    current_page_count = 0.0
+    in_first_scene = False  # Flag to track if we've found the first scene yet
+    
+    for line in lines:
+        stripped_line = line.strip()
+        
+        # Identify new scenes
+        if scene_pattern.match(stripped_line):
+            # Process previous scene
+            if current_scene:
+                current_scene["characters"] = list(current_characters)
+                current_scene["line_count"] = line_count
+                
+                # Calculate page metrics
+                page_count = calculate_page_count(scene_buffer)
+                current_scene["page_count"] = page_count
+                current_scene["start_page"] = current_page_count
+                current_scene["end_page"] = current_page_count + page_count
+                
+                scenes.append(current_scene)
+                scene_buffers.append(scene_buffer)
+                current_page_count += page_count
+                scene_buffer = []
 
-    def _process_scene(self, scene: Scene, scene_buffer: List[str], script: ParsedScript, current_page_count: float):
-        """
-        Finalize the scene's metrics including accurate page count and page ranges.
-        """
-        scene.line_count = len(scene_buffer)
-        scene.raw_text = "\n".join(scene_buffer)
+            # Extract scene components
+            location_text = stripped_line
+            scene_type = "INTERIOR" if "INT." in location_text.upper() and "INT/EXT" not in location_text.upper() else \
+                       "EXTERIOR" if "EXT." in location_text.upper() and "INT/EXT" not in location_text.upper() else \
+                       "INTERIOR_EXTERIOR"
+            
+            # Remove scene number if present
+            if re.match(r'^\d+\.', location_text):
+                location_text = re.sub(r'^\d+\.\s*', '', location_text)
+            
+            # Extract time of day
+            time_of_day = extract_time(location_text)
+            
+            # Clean up location
+            clean_location = re.sub(r'^(INT\.|EXT\.|INT/EXT\.|INT/EXT)\s*', '', location_text)
+            if "-" in clean_location:
+                clean_location = clean_location.split("-")[0]
+            clean_location = re.sub(r'\(.*?\)', '', clean_location)
+            clean_location = clean_location.strip()
+            
+            current_scene = {
+                "scene_number": len(scenes) + 1,
+                "type": scene_type,
+                "location": clean_location,
+                "time_of_day": time_of_day,
+                "raw_heading": stripped_line,
+                "characters": [],
+                "line_count": 0,
+                "page_count": 0.0,
+                "start_page": current_page_count,
+                "end_page": 0.0,
+            }
+            current_characters = set()
+            line_count = 0
+            in_first_scene = True
+            
+        # Add line to scene buffer
+        if current_scene:
+            scene_buffer.append(line)
+            line_count += 1
+
+        # Identify characters from dialogue - but only after we've found the first scene
+        if in_first_scene and is_character_name(stripped_line):
+            # Clean and normalize the character name
+            clean_name = normalize_character_name(stripped_line)
+            current_characters.add(clean_name)
+            all_characters.add(clean_name)
+
+    # Process the last scene
+    if current_scene:
+        current_scene["characters"] = list(current_characters)
+        current_scene["line_count"] = line_count
         
-        # Calculate more accurate page count
-        scene.page_count = self._calculate_page_count(scene_buffer)
+        # Calculate page metrics for last scene
+        page_count = calculate_page_count(scene_buffer)
+        current_scene["page_count"] = page_count
+        current_scene["start_page"] = current_page_count
+        current_scene["end_page"] = current_page_count + page_count
         
-        # Set page range
-        scene.start_page = current_page_count
-        scene.end_page = current_page_count + scene.page_count
+        scenes.append(current_scene)
+        scene_buffers.append(scene_buffer)
+        current_page_count += page_count
+    
+    # Normalize character list to remove duplicates and misspellings
+    normalized_characters = set()
+    for character in all_characters:
+        normalized_characters.add(normalize_character_name(character))
+    all_characters = normalized_characters
+    
+    #-----------------------------------------------------------------------
+    # Second pass: Look for already-identified characters in action description
+    #-----------------------------------------------------------------------
+    
+    # Build a list of all characters found in dialogue
+    character_list = list(all_characters)
+    
+    # For each scene, scan the action text for known character names
+    for i, (scene, buffer) in enumerate(zip(scenes, scene_buffers)):
+        # Convert to normalized character names
+        scene_characters = set(normalize_character_name(char) for char in scene["characters"])
+        scene_text = " ".join(buffer)  # Join all lines for easier text search
         
-        # Calculate estimated duration based on the new page count
-        scene.estimated_duration = self._estimate_duration(scene.line_count, scene.page_count)
+        # Check each known character to see if they're mentioned
+        for character in character_list:
+            # Skip if character is already in this scene
+            if character in scene_characters:
+                continue
+                
+            # Look for exact character name (need to be careful with partial matches)
+            # We use word boundaries to avoid partial matches
+            if re.search(r'\b' + re.escape(character) + r'\b', scene_text):
+                scene_characters.add(character)
         
-        script.scenes.append(scene) 
+        # Update the scene with any newly found characters
+        scenes[i]["characters"] = list(scene_characters)
+    
+    #-----------------------------------------------------------------------
+    # Calculate character statistics
+    #-----------------------------------------------------------------------
+    character_stats = []
+    for character in sorted(list(all_characters)):
+        # Count scenes per character
+        scene_appearances = []
+        line_count = 0
+        
+        for scene_idx, scene in enumerate(scenes):
+            normalized_scene_chars = [normalize_character_name(char) for char in scene["characters"]]
+            if character in normalized_scene_chars:
+                scene_appearances.append(scene_idx + 1)  # 1-based scene numbers
+        
+        # Count lines (approximate)
+        for buffer in scene_buffers:
+            for line_idx, line in enumerate(buffer):
+                normalized_line = normalize_character_name(line.strip())
+                if normalized_line == character:
+                    line_count += 1  # Count the character cue
+                    # Count the lines of dialogue that follow
+                    dialogue_count = 0
+                    for following_line in buffer[line_idx+1:]:
+                        if not following_line.strip():
+                            continue
+                        if is_character_name(following_line):
+                            break
+                        dialogue_count += 1
+                    line_count += dialogue_count
+        
+        character_stats.append({
+            "name": character,
+            "scene_appearances": scene_appearances,
+            "total_lines": max(1, line_count)  # Ensure at least 1 line
+        })
+    
+    return {
+        "screenplay": {
+            "title": title,
+            "scenes": scenes,
+            "characters": character_stats,
+            "all_characters": sorted(list(all_characters)),
+            "total_pages": round(current_page_count, 2)
+        }
+    }
+
+def screenplay_to_json(screenplay_data, output_file):
+    """
+    Save screenplay data to a JSON file.
+    
+    Args:
+        screenplay_data: The parsed screenplay data
+        output_file: Path to save the JSON file
+    """
+    with open(output_file, 'w', encoding='utf-8') as json_file:
+        json.dump(screenplay_data, json_file, indent=4, ensure_ascii=False)
+
+def debug_parse(script, title=None, verbose=True):
+    """
+    Parse a screenplay with debugging information.
+    
+    Args:
+        script: Script text content
+        title: Script title (defaults to "Debug Script")
+        verbose: Whether to print detailed information
+        
+    Returns:
+        The parsed screenplay data
+    """
+    if title is None:
+        title = "Debug Script"
+        
+    if verbose:
+        print(f"Parsing script: {title}")
+        print(f"Script length: {len(script)} characters")
+        
+    # Track what we find
+    scene_headings = []
+    dialogue_characters = []
+    rejected_characters = []
+    
+    # Use patterns from parse_screenplay
+    scene_pattern = re.compile(r'^\s*(\d+\.\s*)?(INT\.|EXT\.|INT/EXT\.|INT/EXT)')
+    character_pattern = re.compile(r"^[A-Z][A-Z\s]+$")
+    
+    # First pass - identify scenes and dialogue characters
+    lines = script.split("\n")
+    in_scene = False
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+            
+        # Check for scene heading
+        if scene_pattern.match(stripped):
+            if verbose:
+                print(f"Line {i+1}: Scene heading found: {stripped}")
+            scene_headings.append((i+1, stripped))
+            in_scene = True
+            
+        # Only look for characters within scenes
+        if not in_scene:
+            continue
+            
+        # Character detection
+        clean_name = re.sub(r"\(.*?\)", "", stripped).strip()
+        if character_pattern.match(clean_name):
+            if len(clean_name.split()) <= 5 and len(clean_name) <= 40:
+                from format_parsers import is_character_name
+                if is_character_name(stripped):
+                    if verbose:
+                        print(f"Line {i+1}: Character found: {stripped}")
+                    dialogue_characters.append((i+1, stripped))
+                else:
+                    if verbose:
+                        print(f"Line {i+1}: Rejected as character: {stripped}")
+                    rejected_characters.append((i+1, stripped))
+    
+    if verbose:
+        print(f"\nFound {len(scene_headings)} scene headings")
+        print(f"Found {len(dialogue_characters)} dialogue character cues")
+        print(f"Rejected {len(rejected_characters)} false character cues")
+        
+    # Parse the full screenplay
+    result = parse_screenplay(script, title)
+    
+    if verbose:
+        print(f"\nParsed {len(result['screenplay']['scenes'])} scenes")
+        print(f"Parsed {len(result['screenplay']['all_characters'])} characters")
+        
+        # Print scene summary
+        print("\nScene Summary:")
+        for i, scene in enumerate(result['screenplay']['scenes']):
+            print(f"Scene {i+1}: {scene['type']} - {scene['location']} - {scene['time_of_day']}")
+            print(f"  Characters: {', '.join(scene['characters'])}")
+            print(f"  Lines: {scene['line_count']}, Pages: {scene['page_count']:.2f}")
+            
+        # Print character summary
+        print("\nCharacter Summary:")
+        for char in result['screenplay']['characters']:
+            print(f"{char['name']}: {len(char['scene_appearances'])} scenes, {char['total_lines']} lines")
+            
+    return result
+
+def detect_character_issues(screenplay_data):
+    """
+    Analyze a parsed screenplay for potential character detection issues.
+    
+    Args:
+        screenplay_data: The parsed screenplay data
+        
+    Returns:
+        Dictionary with issue analysis
+    """
+    characters = screenplay_data["screenplay"]["all_characters"]
+    scenes = screenplay_data["screenplay"]["scenes"]
+    
+    # Potentially problematic character names
+    suspicious_terms = [
+        "WIDE", "ANGLE", "CLOSE", "PAN", "TRACK", "DOLLY", "MOTION", "LAPSE",
+        "VIEW", "BLACK", "SOUND", "MUSIC", "MONTAGE", "SERIES", "SHOTS",
+        "SAME", "LATER", "CONTINUOUS", "FADE", "CUT", "DISSOLVE", "SMASH",
+        "PRELAP", "HOLD", "BACK", "INSTRUCTIONS", "GATHER", "PRESENTS"
+    ]
+    
+    potential_problems = []
+    
+    # Check for suspicious character names
+    for character in characters:
+        for term in suspicious_terms:
+            if term in character:
+                potential_problems.append({
+                    "character": character,
+                    "issue": f"Contains suspicious term '{term}'",
+                    "recommendation": "May be a camera direction or technical instruction"
+                })
+                break
+                
+        # Check for very rare appearances
+        char_scenes = 0
+        for scene in scenes:
+            if character in scene["characters"]:
+                char_scenes += 1
+        
+        if char_scenes <= 1:
+            potential_problems.append({
+                "character": character,
+                "issue": f"Only appears in {char_scenes} scene",
+                "recommendation": "May be a misdetected camera direction or minor character"
+            })
+    
+    # Check for similar character names that might be the same character
+    for i, char1 in enumerate(characters):
+        for char2 in characters[i+1:]:
+            # Skip identical names
+            if char1 == char2:
+                continue
+                
+            # Check for common variations
+            if char1 in char2 or char2 in char1:
+                potential_problems.append({
+                    "character": f"{char1} / {char2}",
+                    "issue": "Similar character names",
+                    "recommendation": "May be variations of the same character"
+                })
+                
+            # Check for common misspellings
+            elif (char1.replace("IE", "Y") == char2) or (char2.replace("IE", "Y") == char1):
+                potential_problems.append({
+                    "character": f"{char1} / {char2}",
+                    "issue": "Possible spelling variation",
+                    "recommendation": "May be misspellings of the same character"
+                })
+    
+    return {
+        "total_characters": len(characters),
+        "potential_issues": len(potential_problems),
+        "issues": potential_problems
+    }
