@@ -2,19 +2,16 @@ from flask import Flask, request, jsonify
 import tempfile
 import os
 from format_parsers import parse_screenplay  # Import from format_parsers instead of parser
-import pdfplumber  # Import pdfplumber directly for extract_text_from_pdf
+from pypdf import PdfReader  # Use pypdf for faster PDF extraction
 
 app = Flask(__name__)
 
 def extract_text_from_pdf(pdf_path):
     """
-    Extract text content from a PDF file.
+    Extract text content from a PDF file using pypdf for speed.
     """
-    with pdfplumber.open(pdf_path) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text() + "\n"
-    return text
+    reader = PdfReader(pdf_path)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 @app.route('/')
 def home():
